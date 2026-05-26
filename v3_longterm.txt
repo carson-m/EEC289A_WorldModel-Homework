@@ -1,0 +1,99 @@
+Here is a notebook-style document analyzing the transition from the base version to the **v3_longterm** version, along with strategic recommendations for further adjustments.
+
+---
+
+# 📓 Notebook: World Model Upgrade Analysis (Base to v3_longterm)
+
+## 1. Introduction
+
+This document reviews the architectural, objective, and configuration changes introduced in the `v3_longterm` world model. The primary goal of `v3_longterm` is clearly to stabilize long-horizon predictions using Recurrent Neural Networks (GRUs), curriculum learning, and advanced gradient routing.
+
+---
+
+## 2. Configuration Evolution (`yaml` changes)
+
+The configuration file shifts the model from a rapid prototype state to a robust, long-term training regime.
+
+### Key Changes:
+
+* **Model Capacity**: `hidden_dim` doubled from 128 to 256. `use_gru` is officially enabled (`true`).
+* **Training Regime**:
+* `updates` increased from 2000 to 8000, signaling a deeper training cycle.
+* `learning_rate` reduced significantly ($1.0 \times 10^{-3} \rightarrow 4.0 \times 10^{-4}$) to stabilize the GRU training.
+* `grad_clip_norm` tightened aggressively from 10.0 to 1.0 to prevent RNN gradient explosions.
+
+
+* **Loss Weighting**: Added dedicated long-horizon parameters (`long_rollout_weight: 0.01`, `long_rollout_horizon: 35`), enabling the model to explicitly optimize for long-term coherence.
+* **Evaluation**: Focused the reporting horizons to denser intervals up to 200 rather than extending to 1000 blindly, allowing for finer-grained debugging of mid-range rollouts.
+
+---
+
+## 3. Architecture Upgrades (`model_v3_longterm.py` vs `model (11).py`)
+
+The student model has been entirely rewritten from a basic MLP to a highly specialized "Powerful + Lightweight Hybrid" recurrent model.
+
+### Key Changes:
+
+* **Residual Blocks & Normalization**: Replaced basic `Linear -> SiLU` stacks with custom `ResBlock` modules and `LayerNorm`. This helps maintain gradient flow through deeper layers.
+* **Orthogonal Initialization (Power Trick)**: GRU hidden-to-hidden and input-to-hidden weights are now initialized orthogonally. This is a crucial fix to prevent vanishing/exploding gradients during long sequence rollouts.
+* **Linear Skip Connection (Power Trick)**: Added a zero-initialized linear layer that bypasses the encoder/GRU/decoder entirely. This allows the model to learn easy 1-step linear physics instantly without clogging up the GRU's representational capacity.
+* **Input Noise Injection**: Added Gaussian noise ($\mathcal{N}(0, 0.002)$) to normalized observations during training. This acts as a strong regularizer to prevent the model from overfitting to exact states, enforcing robustness during autoregressive rollouts.
+* **Removed Delta Limit**: The old model scaled outputs using `tanh` and a `delta_limit`. The v3 model directly adds the `delta_pred + skip_pred`.
+
+---
+
+## 4. Loss Function & Curriculum Advancements (`losses_v3_longterm.py` vs `losses (11).py`)
+
+The loss logic experienced the most drastic overhaul, shifting towards temporal awareness and progressive curriculum learning.
+
+### Key Changes:
+
+* **GRU-Friendly One-Step Loss**: The old baseline flattened all states and computed MSE. The v3 version iterates temporally (`for t in range(T)`), properly passing the hidden state forward. This ensures the GRU learns causal temporal dynamics from the very first step.
+* **Smooth L1 Loss & Temporal Decay**: The `rollout_loss` transitioned from MSE to `F.smooth_l1_loss` (Huber Loss), which is less sensitive to extreme outliers in long rollouts. It also introduces a linearly decaying weight schedule (`torch.linspace(1.0, 0.2, H)`), forgiving errors that happen further out in the horizon.
+* **Stateful Cosine Curriculum**: Implemented a global tracker (`_GLOBAL_UPDATE_STEP`). After a 2500-step delay, a cosine schedule dynamically scales:
+1. The `current_horizon` from 8 up to 15.
+2. The `rollout_weight` from 0.2 up to 0.4.
+3. A secondary `long_h` (long rollout horizon) that activates a dedicated `long_rollout` loss.
+
+
+
+---
+
+## 5. Suggestions for Further Adjustment
+
+While `v3_longterm` is highly sophisticated, there are a few architectural and logic quirks that could be adjusted for even better performance:
+
+### A. Fix Unused Parameters (Code Cleanup)
+
+In `model_v3_longterm.py`, you still accept `delta_limit: float = 3.0` in the `__init__`, and `student_v3_longterm.yaml` specifies `delta_limit: 1.0`. However, **the variable `self.delta_limit` is never used in the v3 `forward()` pass**.
+
+* **Fix**: Either remove it entirely to clean up the code, or reinstate a scaled `tanh` clamp on the final `delta_pred` to guarantee bounded predictions.
+
+### B. Curriculum Decay for Noise Injection
+
+Currently, the noise injection (`0.002`) is constant throughout training.
+
+* **Adjustment**: Tie the noise scale to the `cos_factor` from your curriculum. You might want higher noise early on to encourage exploration, decaying to `0.0` or `0.0005` as the model fine-tunes its long-horizon predictions.
+
+### C. Refine the Loss Temporal Weighting
+
+In `losses_v3_longterm.py`, you use a linear decay for rollout weights:
+
+```python
+weights = torch.linspace(1.0, 0.2, H, device=per_step_loss.device)
+
+```
+
+* **Adjustment**: As the curriculum progresses and the model gets better at long horizons, you could dynamically flatten this curve towards `(1.0, 1.0)`. Penalizing long-horizon errors less is great early in training, but late in training, you want the model to care equally about step 15 and step 1.
+
+### D. Optimize the One-Step Loop
+
+The current `one_step_delta_loss` uses a Python `for` loop over time steps `T`. This is highly unoptimized in PyTorch and creates a massive computation graph.
+
+* **Adjustment**: Since it's a one-step loss (not autoregressive), you can process the entire sequence in a single batched pass through the GRU by utilizing `torch.nn.GRU` instead of `nn.GRUCell`, which runs at C++/CUDA speeds.
+
+### E. Long Rollout Overlap
+
+Your main rollout reaches up to $H=15$, and your long rollout reaches up to $H=35$. Right now, both losses compute errors for steps 1-15 redundantly.
+
+* **Adjustment**: To save compute, adjust the `long_rollout` to only compute the loss for the slice `[16:35]`, preventing overlapping gradient signals on the earlier steps.
